@@ -1,17 +1,15 @@
 import os
-import sys
+import re
 import io
 import json
 import requests
 import pandas as pd
 from PIL import Image
 from dotenv import load_dotenv
-from typing import Optional
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from google import genai
-import contextlib
 
 load_dotenv()
 
@@ -131,6 +129,20 @@ def generate_scraping_code(task: str):
 # Answer questions
 # ------------------
 def answer_questions_with_gemini(questions: str, scraped_data: str) -> str:
+    
+    if scraped_data == "No data":
+        response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[f"""
+                  No data is available to answer the questions, so only return the json object in the same structure as specified in the question below. Also do not add any explanations or additional text. Return the json object as plain text and don't include any code blocks (```python/json```, etc).
+                  
+                  {questions}
+                  """],
+        )
+        content = response.text
+        content = re.sub(r"\s+", " ", content)
+        return content
+
     prompt = f"""
 You are a data analyst. Below is the data that has been scraped from the web, and a set of questions that must be answered based on this data. The output must be a JSON object
 
@@ -148,7 +160,8 @@ pandas
 numpy
 scipy
 
-So make sure not to use any library which would need installation
+So make sure not to use any library which would need installation.
+Don't use networkx library
 
 ---DATA---
 {scraped_data}
@@ -160,10 +173,8 @@ RULES:
 1. The output must be a JSON object
 2. Your job is to provide the code that will answer these questions.
 3. Answer should be in the structure of response of given in question.
-4. If csv file sent with POST required, it is present in "sent_csv/data.csv"
-5. If image sent with POST required, it is present in "sent_image/image.png"
-6. Construct the final JSON object using JSON.dumps()
-7. Assign the JSON string to a variable named output (do not print)
+4. Construct the final JSON object using JSON.dumps()
+5. Assign the JSON string to a variable named output (do not print)
 """
     response = client.models.generate_content(
         model="gemini-2.5-flash",
@@ -179,33 +190,79 @@ RULES:
 # ------------------
 # FastAPI endpoints
 # ------------------
+from fastapi import Request
+
+from typing import List, Tuple
+from fastapi import Request, UploadFile, File
+from fastapi.responses import JSONResponse
+import pandas as pd
+from PIL import Image
+import io, os
+
 @app.post("/api/")
-async def upload_file(
-    questions: UploadFile = File(..., alias="questions.txt"),
-    image: Optional[UploadFile] = File(None, alias="image.png"),
-    data: Optional[UploadFile] = File(None, alias="data.csv")
-):
+async def upload_file(request: Request, questions: UploadFile = File(None, alias="questions.txt")):
     try:
-        text = (await questions.read()).decode("utf-8")
+        form = await request.form()
+        files: List[Tuple[str, UploadFile]] = []
 
-        if image:
-            img_bytes = await image.read()
-            Image.open(io.BytesIO(img_bytes))  # just to validate
+        # Collect all file-like objects flexibly
+        for key, value in form.multi_items():
+            try:
+                filename = getattr(value, "filename", None)
+                read_method = getattr(value, "read", None)
+                if filename and callable(read_method):
+                    files.append((key, value))
+            except Exception:
+                continue
 
-        if data:
-            csv_bytes = await data.read()
-            df = pd.read_csv(io.BytesIO(csv_bytes))
-            scraped_data = df.to_csv(index=False)
+        # Handle questions.txt (or fallback to text field)
+        text = None
+        if questions:
+            text = (await questions.read()).decode("utf-8").strip()
+        elif "questions.txt" in form or "question" in form:
+            text = str(form.get("questions.txt") or form.get("question") or "").strip()
+
+        if not text:
+            return JSONResponse(status_code=400, content={"error": "Missing questions.txt or question text"})
+
+        scraped_data = None
+
+        # Process all other uploaded files dynamically
+        for key, file in files:
+            if key == "questions.txt":
+                continue  # already handled
+
+            filename = file.filename.lower()
+
+            # CSV file
+            if filename.endswith(".csv"):
+                csv_bytes = await file.read()
+                df = pd.read_csv(io.BytesIO(csv_bytes))
+                scraped_data = df.to_csv(index=False)
+
+            # Image file
+            elif filename.endswith((".png", ".jpg", ".jpeg")):
+                img_bytes = await file.read()
+                Image.open(io.BytesIO(img_bytes))  # validate
+
+        # If we have CSV data, answer directly
+        if scraped_data:
             task_file = answer_questions_with_gemini(text, scraped_data)
-            return run_with_retry(task_file)
+            return run_with_retry(task_file, max_attempts=6)
 
-        scraper_path = generate_scraping_code(text)
-        run_with_retry(scraper_path)
-        scraped_file = os.path.join(TMP_DIR, "scraped_data.txt")
-        with open(scraped_file, "r") as f:
-            scraped_data = f.read()
-        task_file = answer_questions_with_gemini(text, scraped_data)
-        return run_with_retry(task_file)
+        # Otherwise, try scraping fallback
+        try:
+            scraper_path = generate_scraping_code(text)
+            run_with_retry(scraper_path)
+            scraped_file = os.path.join(TMP_DIR, "scraped_data.txt")
+            with open(scraped_file, "r") as f:
+                scraped_data = f.read()
+            task_file = answer_questions_with_gemini(text, scraped_data)
+            return run_with_retry(task_file, max_attempts=4)
+        except Exception:
+            # If scraping fails too
+            task_file = answer_questions_with_gemini(text, scraped_data="No data")
+            return task_file
 
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
@@ -213,3 +270,7 @@ async def upload_file(
 @app.get("/")
 async def root():
     return {"message": "Hello!"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5045)
